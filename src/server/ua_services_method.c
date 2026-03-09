@@ -158,7 +158,10 @@ callWithResolvedMethodAndObject(UA_Server *server, UA_Session *session,
 
     /* Verify access rights */
     UA_Boolean executable = resolvedMethod->executable;
-    if(session != &server->adminSession) {
+    if(executable && session != &server->adminSession) {
+		checkLock(server, true);
+		unlockServer(server);
+		checkLock(server, false);
         executable = executable && server->config.accessControl.
             getUserExecutableOnObject(server, &server->config.accessControl,
                                       &session->sessionId, session->context,
@@ -166,6 +169,7 @@ callWithResolvedMethodAndObject(UA_Server *server, UA_Session *session,
                                       resolvedMethod->head.context,
                                       &request->objectId,
                                       callContext->head.context);
+		lockServer(server);
     }
     if(!executable)
         return UA_STATUSCODE_BADNOTEXECUTABLE;
@@ -240,12 +244,17 @@ callWithResolvedMethodAndObject(UA_Server *server, UA_Session *session,
 
     /* Call the method. If this is an async method, unlock the server lock for
      * the duration of the (long-running) call. */
-    return resolvedMethod->method(server, &session->sessionId, session->context,
+	checkLock(server, true);
+	unlockLock(server);
+	checkLock(server, true);
+	const UA_StatusCode status = resolvedMethod->method(server, &session->sessionId, session->context,
                                   &resolvedMethod->head.nodeId,
                                   resolvedMethod->head.context,
                                   &callContext->head.nodeId, callContext->head.context,
                                   request->inputArgumentsSize, mutableInputArgs,
                                   result->outputArgumentsSize, result->outputArguments);
+	lockLock(server);
+	return status;
 
     /* TODO: Verify Output matches the argument definition */
 }
@@ -374,12 +383,36 @@ Operation_CallMethod(UA_Server *server, UA_Session *session,
     return (result->statusCode != UA_STATUSCODE_GOODCOMPLETESASYNCHRONOUSLY);
 }
 
-UA_CallMethodResult
-UA_Server_call(UA_Server *server, const UA_CallMethodRequest *request) {
+UA_CallMethodResult UA_Server_call(UA_Server *server, const UA_CallMethodRequest *request) {
+	return UA_Server_callEx(server, request, NULL);
+}
+
+UA_CallMethodResult UA_Server_callEx(UA_Server *server, const UA_CallMethodRequest *request, void* context) {
     UA_CallMethodResult result;
     UA_CallMethodResult_init(&result);
     lockServer(server);
-    Operation_CallMethod(server, &server->adminSession, request, &result);
+
+	void *sessionToken = NULL;
+	UA_Session *session = &server->adminSession;
+
+	if (NULL != context) {
+		UA_AsyncOperation *ao = (UA_AsyncOperation*)context;
+		sessionToken = acquireSessionEntryById(server, &ao->parent->sessionId, &session);
+		if (NULL == sessionToken)
+			session = NULL;
+}
+
+	if (NULL != session)
+	    Operation_CallMethod(server, &server->adminSession, request, &result);
+	else
+		result.statusCode = UA_STATUSCODE_BADSESSIONIDINVALID;
+
+	if (NULL != sessionToken) {
+		UA_assert(NULL != context);
+		UA_assert(NULL != session);
+		releaseSessionEntry(server, sessionToken);
+	}
+
     /* Cancel asynchronous responses right away */
     if(result.statusCode == UA_STATUSCODE_GOODCOMPLETESASYNCHRONOUSLY) {
         if(server->config.asyncOperationCancelCallback)
@@ -389,5 +422,6 @@ UA_Server_call(UA_Server *server, const UA_CallMethodRequest *request) {
     unlockServer(server);
     return result;
 }
+
 
 #endif /* UA_ENABLE_METHODCALLS */

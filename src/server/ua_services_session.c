@@ -18,6 +18,33 @@
 #include "ua_server_internal.h"
 #include "ua_services.h"
 
+static void removeReference(UA_Server *server, session_list_entry *sentry) {
+	UA_assert(NULL != server);
+	UA_assert(NULL != sentry);
+    UA_LOCK_ASSERT(&server->serviceMutex);
+	checkLock(server, true);
+
+    if (0 == --sentry->nReferences) {
+        /* Add a delayed callback to remove the session when the currently
+         * scheduled jobs have completed */
+        sentry->cleanupCallback.callback = (UA_Callback)removeSessionCallback;
+        sentry->cleanupCallback.application = server;
+        sentry->cleanupCallback.context = sentry;
+        UA_EventLoop *el = server->config.eventLoop;
+        el->addDelayedCallback(el, &sentry->cleanupCallback);
+    }
+}
+
+static void addReference(UA_Server *server, session_list_entry *sentry) {
+	UA_assert(NULL != server);
+	UA_assert(NULL != sentry);
+    UA_LOCK_ASSERT(&server->serviceMutex);
+	checkLock(server, true);
+
+    UA_assert(0 < sentry->nReferences);
+    ++sentry->nReferences;
+}
+
 void
 notifySession(UA_Server *server, UA_Session *session,
               UA_ApplicationNotificationType type) {
@@ -90,13 +117,6 @@ UA_Session_remove(UA_Server *server, UA_Session *session,
     }
 #endif
 
-    /* Callback into userland access control */
-    if(server->config.accessControl.closeSession) {
-        server->config.accessControl.
-            closeSession(server, &server->config.accessControl,
-                         &session->sessionId, session->context);
-    }
-
     /* Detach the Session from the SecureChannel */
     UA_Session_detachFromSecureChannel(server, session);
 
@@ -136,13 +156,7 @@ UA_Session_remove(UA_Server *server, UA_Session *session,
     /* Notify the application */
     notifySession(server, session, UA_APPLICATIONNOTIFICATIONTYPE_SESSION_CLOSED);
 
-    /* Add a delayed callback to remove the session when the currently
-     * scheduled jobs have completed */
-    sentry->cleanupCallback.callback = (UA_Callback)removeSessionCallback;
-    sentry->cleanupCallback.application = server;
-    sentry->cleanupCallback.context = sentry;
-    UA_EventLoop *el = server->config.eventLoop;
-    el->addDelayedCallback(el, &sentry->cleanupCallback);
+    removeReference(server, sentry);
 }
 
 void
@@ -186,6 +200,42 @@ getSessionByToken(UA_Server *server, const UA_NodeId *token) {
     }
 
     return NULL;
+}
+
+session_list_entry *acquireSessionEntryById(UA_Server *server, const UA_NodeId *sessionId, UA_Session **pSession) {
+    UA_assert(NULL != server);
+    UA_assert(NULL != sessionId);
+    UA_assert(NULL != pSession);
+    UA_LOCK_ASSERT(&server->serviceMutex);
+    checkLock(server, true);
+
+    session_list_entry *current = NULL;
+    LIST_FOREACH(current, &server->sessions, pointers) {
+        /* Token does not match */
+        if(!UA_NodeId_equal(&current->session.sessionId, sessionId))
+            continue;
+
+        /* Session has timed out */
+        if(UA_DateTime_nowMonotonic() > current->session.validTill) {
+            UA_LOG_INFO_SESSION(server->config.logging, &current->session,
+                                "Client tries to use a session that has timed out");
+            return NULL;
+        }
+
+        addReference(server, current);
+        *pSession = &current->session;
+        return current;
+    }
+
+    return NULL;
+}
+
+void releaseSessionEntry(UA_Server *server, session_list_entry *sentry) {
+    UA_LOCK_ASSERT(&server->serviceMutex);
+    checkLock(server, true);
+    UA_assert(NULL != server);
+    UA_assert(NULL != sentry);
+    removeReference(server, sentry);
 }
 
 UA_Session *
@@ -386,6 +436,7 @@ UA_Session_create(UA_Server *server, UA_SecureChannel *channel,
 
     /* Initialize the Session */
     UA_Session_init(&newentry->session);
+    newentry->nReferences = 1;
     newentry->session.sessionId = UA_NODEID_GUID(1, UA_Guid_random());
     newentry->session.authenticationToken = UA_NODEID_GUID(1, UA_Guid_random());
 

@@ -1491,3 +1491,10 @@ void unlockServer(UA_Server *server) {
         server->config.eventLoop->unlock(server->config.eventLoop);
     UA_UNLOCK(&server->serviceMutex);
 }
+
+void checkLock(UA_Server *server, bool isLocked) {
+	if (isLocked)
+		UA_assert(0 < server->serviceMutex.mutexCounter);
+	else
+		UA_assert(0 == server->serviceMutex.mutexCounter);
+}
